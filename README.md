@@ -18,6 +18,7 @@ The system supports dual deployment modes (monolith and microservices), three in
 - [API Reference](#api-reference)
 - [Database Schema](#database-schema)
 - [Monitoring & Observability](#monitoring--observability)
+- [LLM Reliability Layer](#llm-reliability-layer)
 - [Benchmarking](#benchmarking)
 - [Backup Strategy](#backup-strategy)
 - [Project Structure](#project-structure)
@@ -273,7 +274,7 @@ python benchmark_ml.py --iterations 30 --export
 | **Reverse Proxy** | Nginx 1.27 |
 | **Containerization** | Docker (Python 3.12-slim) |
 | **Orchestration** | Kubernetes |
-| **Frontend** | Vanilla JS + CSS (single-page app) |
+| **Frontend** | Vanilla JS + CSS (single-page app, light/dark mode) |
 
 ---
 
@@ -281,7 +282,7 @@ python benchmark_ml.py --iterations 30 --export
 
 ### Prerequisites
 
-- Python 3.12+
+- Python 3.11+ (3.11 pinned for Render via `.python-version`)
 - PostgreSQL 16+
 - A Gemini API key
 - (Optional) Trained ML model files in `models/`
@@ -405,6 +406,16 @@ The Blueprint provisions:
 - **Public mode** — `PUBLIC_MODE=true` hides dev-only UI sections (Agent Status, System Metrics, Traces)
 
 A separate `requirements-deploy.txt` is used for the Render build to keep the deployment image lightweight.
+
+### Progressive Web App (PWA)
+
+A standalone PWA version lives in the `pwa/` directory, providing an offline-capable mobile experience with its own `manifest.json` and service worker (`sw.js`). It is deployed automatically to GitHub Pages via a GitHub Actions workflow (`.github/workflows/deploy-pwa.yml`) on every push to `master` that touches `pwa/**`.
+
+```bash
+# Local preview
+cd pwa && python -m http.server 8080
+# Open http://localhost:8080 — install via browser "Add to Home Screen"
+```
 
 ---
 
@@ -551,6 +562,26 @@ JSON-formatted logs compatible with Docker log drivers, Loki, and CloudWatch. En
 
 ---
 
+## LLM Reliability Layer
+
+A dedicated reliability layer wraps all LLM calls with validation, retry logic, and fallback parsing. The modules are:
+
+| Module | Purpose |
+|--------|---------|
+| `llm_config.py` | Per-task generation configs (temperature, max tokens) and prompt versioning with A/B testing |
+| `llm_schemas.py` | Strict Pydantic models (`FoodItem`, `FoodParseResult`, `IntentClassification`) for LLM output validation |
+| `llm_validators.py` | Post-parse semantic checks (calorie consistency, fiber ≤ carbs, plausibility ranges) |
+| `llm_reliability.py` | Retry loop with structured error feedback, JSON extraction from messy output, rule-based fallback parser (~50 common foods) |
+| `llm_metrics.py` | Per-task success/retry/fallback rates, latency percentiles, token usage, and error breakdowns |
+| `token_budget.py` | Per-user daily token budget tracking with auto-reset and conversation history truncation |
+
+**Key features:**
+- **Retry with feedback** — On validation failure, the error is fed back to the LLM in the next attempt so it can self-correct (up to `LLM_MAX_RETRIES`, default 3).
+- **Rule-based fallback** — If all LLM retries fail, a local parser with ~50 common foods provides a best-effort response.
+- **Token budgets** — Each user gets a daily token limit (`LLM_DAILY_TOKEN_LIMIT`, default 100K tokens). Conversation history is truncated to `LLM_MAX_CONTEXT_TOKENS` (default 4000).
+
+---
+
 ## Benchmarking
 
 The project includes four benchmark suites for measuring performance across different workloads and deployment modes.
@@ -681,9 +712,24 @@ my_product/
 |
 +-- Frontend
 |   +-- static/
-|       +-- index.html               # Single-page application
-|       +-- app.js                   # UI logic & protocol switching
-|       +-- style.css                # Responsive styling
+|   |   +-- index.html               # Single-page application
+|   |   +-- app.js                   # UI logic, protocol switching, dark mode
+|   |   +-- style.css                # Responsive styling + light/dark themes
+|   +-- pwa/                         # Progressive Web App (offline mobile)
+|       +-- index.html               # PWA shell
+|       +-- app.js                   # PWA logic
+|       +-- style.css                # PWA styling
+|       +-- manifest.json            # Web app manifest
+|       +-- sw.js                    # Service worker (offline caching)
+|       +-- icon.svg                 # App icon
+|
++-- LLM Reliability
+|   +-- llm_config.py               # Generation configs & prompt A/B testing
+|   +-- llm_schemas.py              # Strict Pydantic models for LLM outputs
+|   +-- llm_validators.py           # Semantic validation (calorie consistency, etc.)
+|   +-- llm_reliability.py          # Retry loop, JSON extraction, fallback parser
+|   +-- llm_metrics.py              # Per-task success rates, latency, token usage
+|   +-- token_budget.py             # Per-user daily token budget management
 |
 +-- Infrastructure
 |   +-- Dockerfile
@@ -693,6 +739,10 @@ my_product/
 |   +-- nginx.microservices.conf         # Nginx (microservices)
 |   +-- entrypoint.sh                    # Container startup
 |   +-- backup.sh                        # Database backup script
+|   +-- .python-version                 # Python 3.11 pin (for Render)
+|
++-- .github/workflows/
+|   +-- deploy-pwa.yml               # GitHub Actions: deploy PWA to GitHub Pages
 |
 +-- k8s/                             # Kubernetes manifests
 |   +-- namespace.yaml
@@ -711,6 +761,8 @@ my_product/
 +-- Testing & Benchmarks
 |   +-- test_system.py               # End-to-end system tests
 |   +-- test_toon.py                 # TOON protocol tests
+|   +-- test_food_inputs.py          # 200+ noisy food descriptions for LLM testing
+|   +-- test_llm_reliability.py      # Full pytest suite for LLM reliability layer
 |   +-- benchmark.py                 # Protocol benchmark (monolith)
 |   +-- benchmark_containers.py      # Protocol benchmark (containers)
 |   +-- benchmark_inference.py       # ML model cold start & latency benchmark
@@ -742,6 +794,10 @@ my_product/
 | `APP_PORT` | No | `8000` | Server bind port |
 | `PUBLIC_MODE` | No | `false` | Hide dev-only UI sections (for public deployments) |
 | `JSON_LOGS` | No | `false` | Enable structured JSON logging |
+| `LLM_MAX_RETRIES` | No | `3` | Max LLM retry attempts per call |
+| `LLM_BACKOFF_BASE` | No | `1.0` | Exponential backoff base (seconds) |
+| `LLM_DAILY_TOKEN_LIMIT` | No | `100000` | Per-user daily token budget |
+| `LLM_MAX_CONTEXT_TOKENS` | No | `4000` | Max conversation history tokens |
 | `ML_MODEL_PATH` | No | `models/food_classifier.pth` | Path to PyTorch model weights |
 | `ML_TRACED_MODEL_PATH` | No | `models/food_classifier_traced.pt` | Path to TorchScript model |
 | `ML_CLASSES_PATH` | No | `models/food_classes.json` | Path to class names JSON |
